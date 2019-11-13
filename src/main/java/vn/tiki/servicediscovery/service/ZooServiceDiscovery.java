@@ -1,16 +1,20 @@
 package vn.tiki.servicediscovery.service;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import org.apache.zookeeper.CreateMode;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.KeeperException.NodeExistsException;
 import org.apache.zookeeper.WatchedEvent;
 import org.apache.zookeeper.Watcher;
+import org.apache.zookeeper.Watcher.WatcherType;
 import org.apache.zookeeper.ZooDefs.Ids;
 import org.apache.zookeeper.ZooKeeper;
 
@@ -24,6 +28,7 @@ import vn.tiki.servicediscovery.model.ServiceInfo;
  */
 @Slf4j
 public class ZooServiceDiscovery implements ServiceDiscovery {
+    public static final int SESSION_TIMEOUT_MILI = 2000;
     public static final int CONNECTION_TIMEOUT_MILI = 5000;
 
     private ZooKeeper zookeeper;
@@ -31,22 +36,28 @@ public class ZooServiceDiscovery implements ServiceDiscovery {
     private String connectionString;
     private String registryPath;
     private ServiceInfo info;
-    private int timeOutConnection;
+    private int sessionTimeOut;
+    private int connectionTimeOut;
     private List<ServiceDiscoveryListener> listeners;
+
+    private boolean firstInit = true;
 
     @Getter
     private Map<String, ServiceInfo> nodeInfos;
 
     public ZooServiceDiscovery(String connectionString, String registryPath, ServiceInfo info) {
-        this(connectionString, CONNECTION_TIMEOUT_MILI, registryPath, info);
+        this(connectionString, SESSION_TIMEOUT_MILI, CONNECTION_TIMEOUT_MILI, registryPath, info);
     }
 
-    public ZooServiceDiscovery(String connectionString, int timeOutConnection, String registryPath, ServiceInfo info) {
+    public ZooServiceDiscovery(String connectionString, int sessionTimeOut, int connectionTimeOut, String registryPath,
+            ServiceInfo info) {
         this.connectionString = connectionString;
         this.registryPath = registryPath;
-        this.timeOutConnection = timeOutConnection;
+        this.sessionTimeOut = sessionTimeOut;
+        this.connectionTimeOut = connectionTimeOut;
         nodeInfos = new HashMap<String, ServiceInfo>();
-        info.setId(info.getId().replace("/", ""));
+        if (info != null && info.getId() != null)
+            info.setId(info.getId().replace("/", ""));
         this.info = info;
         listeners = new ArrayList<>();
     }
@@ -62,13 +73,45 @@ public class ZooServiceDiscovery implements ServiceDiscovery {
     }
 
     @Override
-    public void start() throws KeeperException, InterruptedException, NodeExistsException {
-        zookeeper = connectServer(connectionString);
+    public void stop() throws Exception {
+        stop(null);
+    }
+
+    @Override
+    public void stop(Runnable callbackWhenFinish) throws Exception {
+        if (zookeeper != null) {
+            zookeeper.removeAllWatches(registryPath, WatcherType.Children, true);
+            zookeeper.close();
+        }
+        if (callbackWhenFinish != null)
+            callbackWhenFinish.run();
+    }
+
+    @Override
+    public void start() throws Exception {
+        start(null);
+    }
+
+    @Override
+    public void start(Runnable callbackWhenFinish) throws Exception {
+        connectServer(connectionString);
 
         if (info != null) {
-            zookeeper.create(String.format("%s/%s", registryPath, info.getId()), info.getInfo().getBytes(),
-                    Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL);
+            if (info.getId() != null) {
+                String path = String.format("%s/%s", registryPath, info.getId());
+                createAncestorNode(path.substring(0, path.lastIndexOf("/")));
+                zookeeper.create(path, info.getInfo().getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL);
+            } else {
+                String path = String.format("%s/", registryPath);
+                createAncestorNode(path.substring(0, path.lastIndexOf("/")));
+                var stat = zookeeper.create(path, info.getInfo().getBytes(), Ids.OPEN_ACL_UNSAFE,
+                        CreateMode.EPHEMERAL_SEQUENTIAL);
+                info.setId(stat.substring(stat.lastIndexOf("/") + 1));
+            }
         }
+
+        if (callbackWhenFinish != null)
+            callbackWhenFinish.run();
     }
 
     @Override
@@ -76,7 +119,8 @@ public class ZooServiceDiscovery implements ServiceDiscovery {
         if (info != null && data.getId().equals(info.getId())) {
             try {
                 info.setInfo(data.getInfo());
-                zookeeper.setData(String.format("%s/%s", registryPath, info.getId()), info.getInfo().getBytes(), -1);
+                String path = String.format("%s/%s", registryPath, info.getId());
+                zookeeper.setData(path, info.getInfo().getBytes(), -1);
             } catch (KeeperException | InterruptedException e) {
                 log.error(e.getMessage(), e);
             }
@@ -94,43 +138,69 @@ public class ZooServiceDiscovery implements ServiceDiscovery {
         }
     }
 
-    private void reconnect() {
-        zookeeper = connectServer(connectionString);
-        if (zookeeper != null) {
-            monitorNode();
+    private void createAncestorNode(String path) throws KeeperException, InterruptedException {
+        if (path.isEmpty())
+            return;
+        if (zookeeper.exists(path, false) != null)
+            return;
+        createAncestorNode(path.substring(0, path.lastIndexOf("/")));
+        try {
+            zookeeper.create(path, "".getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+        } catch (NodeExistsException e) {
+            log.debug("Node {} existed, have not to create", path);
         }
+
     }
 
-    private ZooKeeper connectServer(String connectionString) {
-        ZooKeeper zk = null;
-        try {
-            latch = new CountDownLatch(1);
-            zk = new ZooKeeper(connectionString, timeOutConnection, new Watcher() {
+    private void reconnect() throws IOException, InterruptedException, TimeoutException {
+        connectServer(connectionString);
+    }
 
-                @Override
-                public void process(WatchedEvent event) {
-                    if (event.getType() == Event.EventType.None) {
-                        if (event.getState() == Event.KeeperState.SyncConnected) {
-                            latch.countDown();
-                            log.info("Connected to zookeeper");
-                            monitorNode();
-                            return;
+    private void connectServer(String connectionString) throws IOException, InterruptedException, TimeoutException {
+
+        latch = new CountDownLatch(1);
+        zookeeper = new ZooKeeper(connectionString, sessionTimeOut, new Watcher() {
+
+            @Override
+            public void process(WatchedEvent event) {
+                if (event.getType() == Event.EventType.None) {
+                    if (event.getState() == Event.KeeperState.SyncConnected) {
+
+                        log.info("Connected to zookeeper");
+                        try {
+                            createAncestorNode(registryPath);
+                        } catch (KeeperException | InterruptedException e) {
+                            log.error(e.getMessage(), e);
                         }
+                        nodeInfos.clear();
+                        monitorNode();
+                        latch.countDown();
+                        return;
+                    }
 
-                        if (event.getState() == Event.KeeperState.Expired
-                                || event.getState() == Event.KeeperState.Disconnected) {
-                            log.info("Reconnecting to zookeeper...");
+                    if (event.getState() == Event.KeeperState.Expired
+                            || event.getState() == Event.KeeperState.Disconnected) {
+                        log.info("Reconnecting to zookeeper...");
+                        try {
                             reconnect();
-                            return;
+                        } catch (IOException | InterruptedException | TimeoutException e) {
+                            log.error(e.getMessage(), e);
                         }
+                        return;
                     }
                 }
-            });
+            }
+        });
+
+        if (firstInit && !latch.await(connectionTimeOut, TimeUnit.MILLISECONDS)) {
+            throw new TimeoutException(
+                    String.format("Time out to connect to zookeeper after %d ms", connectionTimeOut));
+        }else {
             latch.await();
-        } catch (Exception e) {
-            log.error(e.getMessage(), e);
         }
-        return zk;
+        
+        firstInit = false;
+
     }
 
     private void monitorNode() {
@@ -228,7 +298,7 @@ public class ZooServiceDiscovery implements ServiceDiscovery {
     private void infoRegistry() {
         StringBuilder str = new StringBuilder("All datanodes activing: ");
         for (Map.Entry<String, ServiceInfo> entry : nodeInfos.entrySet()) {
-            if (entry.getKey().equals(info.getId()))
+            if (info != null && entry.getKey().equals(info.getId()))
                 str.append(String.format("\n%s(me) ", entry.getValue()));
             else
                 str.append(String.format("\n%s ", entry.getValue()));
